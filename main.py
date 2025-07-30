@@ -1,13 +1,13 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from datetime import datetime
+from contextlib import asynccontextmanager
 import asyncio
 import os
 
-LOG_DIR = "/mnt/data/logs"
+LOG_DIR = "./logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
-app = FastAPI()
 log_queue = asyncio.Queue()
 
 async def writer_task():
@@ -21,10 +21,20 @@ async def writer_task():
                 f.flush()
         except Exception as e:
             print(f"Log write failed: {e}")
+        finally:
+            log_queue.task_done()
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(writer_task())
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    writer = asyncio.create_task(writer_task())
+    yield
+    writer.cancel()
+    try:
+        await writer
+    except asyncio.CancelledError:
+        pass
+
+app = FastAPI(lifespan=lifespan)
 
 @app.post("/log")
 async def receive_log(request: Request):
@@ -44,17 +54,16 @@ async def receive_log(request: Request):
 async def tail_logs(lines: int = 50):
     try:
         log_path = os.path.join(LOG_DIR, f"{datetime.utcnow().strftime('%Y-%m-%d')}.log")
-        with open(log_path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            end = f.tell()
-            size = 0
-            block = []
-            while end > 0 and len(block) < lines:
-                size = min(1024, end)
-                end -= size
-                f.seek(end)
-                block = (f.read(size) + b"".join(block)).splitlines()[-lines:]
-            return [line.decode("utf-8", errors="replace") for line in block]
+        
+        # Check if file exists
+        if not os.path.exists(log_path):
+            return []
+        
+        # Read the file and get the last N lines
+        with open(log_path, "r", encoding="utf-8") as f:
+            all_lines = f.readlines()
+            return [line.strip() for line in all_lines[-lines:]]
+            
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
@@ -63,6 +72,10 @@ async def search_logs(q: str):
     results = []
     log_path = os.path.join(LOG_DIR, f"{datetime.utcnow().strftime('%Y-%m-%d')}.log")
     try:
+        # Check if file exists
+        if not os.path.exists(log_path):
+            return []
+            
         with open(log_path, "r", encoding="utf-8") as f:
             for line in f:
                 if q.lower() in line.lower():
@@ -73,5 +86,11 @@ async def search_logs(q: str):
 
 @app.get("/logs")
 async def list_logs():
-    return sorted(os.listdir(LOG_DIR))
+    try:
+        return sorted([f for f in os.listdir(LOG_DIR) if f.endswith('.log')])
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
